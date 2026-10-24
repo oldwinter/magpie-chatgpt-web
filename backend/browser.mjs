@@ -2,8 +2,8 @@ import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
-import { access, mkdir } from 'node:fs/promises';
-import { createServer } from 'node:net';
+import { access, mkdir, unlink } from 'node:fs/promises';
+import { connect, createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { challengeEvidence, responseFailure } from './http.mjs';
 import { BackendError } from './guard.mjs';
@@ -26,18 +26,52 @@ export function signinTimeoutWindow() {
 
 const claimLocks = new Map();
 
+// Linux abstract sockets are not a portable lock. macOS returns EINVAL for a
+// leading NUL, which the claim catch turned into browserConfiguration.
+export function signinLockAddress(root) {
+  const identity = createHash('sha256').update(process.platform === 'win32' ? root.toLowerCase() : root).digest('hex');
+  if (process.platform === 'win32') return '\\\\.\\pipe\\magpie-signin-' + identity;
+  if (process.platform === 'linux') return '\0magpie-signin-' + identity;
+  // macOS sockaddr_un.sun_path is 104 bytes, including the terminator.
+  return join('/tmp', 'ms-' + identity + '.sock');
+}
+
+function socketHeld(address) {
+  return new Promise(resolveHeld => {
+    const socket = connect(address);
+    const timer = setTimeout(() => { socket.destroy(); resolveHeld(true); }, 500);
+    socket.once('connect', () => { clearTimeout(timer); socket.destroy(); resolveHeld(true); });
+    socket.once('error', () => { clearTimeout(timer); resolveHeld(false); });
+  });
+}
+
+function listenSigninLock(address, allowStaleRetry) {
+  const server = createServer(socket => socket.destroy());
+  return new Promise((resolveLock, reject) => {
+    server.once('error', error => {
+      if (error.code !== 'EADDRINUSE') {
+        reject(new BackendError('browserConfiguration'));
+        return;
+      }
+      if (!allowStaleRetry || address.startsWith('\0') || process.platform === 'win32') {
+        resolveLock(null);
+        return;
+      }
+      socketHeld(address).then(async held => {
+        if (held) { resolveLock(null); return; }
+        await unlink(address).catch(unlinkError => { if (unlinkError.code !== 'ENOENT') throw unlinkError; });
+        resolveLock(await listenSigninLock(address, false));
+      }).catch(() => reject(new BackendError('browserConfiguration')));
+    });
+    server.listen(address, () => { server.unref(); resolveLock(server); });
+  });
+}
+
 async function lockSigninProfile(root) {
   if (!claimLocks.has(root)) {
-    const identity = createHash('sha256').update(process.platform === 'win32' ? root.toLowerCase() : root).digest('hex');
-    const address = process.platform === 'win32' ? '\\\\.\\pipe\\magpie-signin-' + identity : '\0magpie-signin-' + identity;
-    const server = createServer(socket => socket.destroy());
-    const acquisition = new Promise((resolveLock, reject) => {
-      server.once('error', error => {
-        claimLocks.delete(root);
-        if (error.code === 'EADDRINUSE') resolveLock(null);
-        else reject(new BackendError('browserConfiguration'));
-      });
-      server.listen(address, () => { server.unref(); resolveLock(server); });
+    const acquisition = listenSigninLock(signinLockAddress(root), true).catch(error => {
+      claimLocks.delete(root);
+      throw error;
     });
     claimLocks.set(root, acquisition);
   }
